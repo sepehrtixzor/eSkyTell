@@ -1,0 +1,247 @@
+{
+  "entities": {
+    "AppGlobalConfig": {
+      "title": "AppGlobalConfig",
+      "description": "Global application configuration controlled from the no-code Admin Panel for subscription gating, updates, and feature flags.",
+      "type": "object",
+      "properties": {
+        "subscriptionRequired": {
+          "type": "boolean",
+          "description": "When false the app is free for all users; when true users require an active subscription."
+        },
+        "monthlyPriceLabel": {
+          "type": "string",
+          "description": "Display label for monthly subscription price."
+        },
+        "yearlyPriceLabel": {
+          "type": "string",
+          "description": "Display label for yearly subscription price."
+        },
+        "freeTrialDays": {
+          "type": "integer",
+          "description": "Number of free trial days."
+        },
+        "paywallMessage": {
+          "type": "string",
+          "description": "Message shown to users when subscription mode is enabled."
+        },
+        "paymentUrl": {
+          "type": "string",
+          "description": "External checkout or support URL for subscription purchase."
+        },
+        "latestVersionName": {
+          "type": "string",
+          "description": "Latest public version name."
+        },
+        "latestVersionCode": {
+          "type": "integer",
+          "description": "Latest public integer version code."
+        },
+        "updateNotes": {
+          "type": "string",
+          "description": "Release notes for the latest update."
+        },
+        "updateUrl": {
+          "type": "string",
+          "description": "Store or release page URL opened via Intent.ACTION_VIEW."
+        },
+        "forceUpdate": {
+          "type": "boolean",
+          "description": "Whether the update banner emphasizes immediate update."
+        },
+        "enableDualSim": {
+          "type": "boolean",
+          "description": "Feature flag for Dual-SIM selector."
+        },
+        "enableQuickTemplates": {
+          "type": "boolean",
+          "description": "Feature flag for quick SMS reply templates."
+        },
+        "enableQuietHours": {
+          "type": "boolean",
+          "description": "Feature flag for bridge Do Not Disturb quiet hours."
+        },
+        "enableBleGattBridge": {
+          "type": "boolean",
+          "description": "Feature flag for live BLE GATT + RFCOMM bridge."
+        },
+        "updatedBy": {
+          "type": "string",
+          "description": "Admin UID or email that last updated config."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": [
+        "subscriptionRequired",
+        "monthlyPriceLabel",
+        "yearlyPriceLabel",
+        "freeTrialDays",
+        "paywallMessage",
+        "latestVersionName",
+        "latestVersionCode",
+        "forceUpdate",
+        "enableDualSim",
+        "enableQuickTemplates",
+        "enableQuietHours",
+        "enableBleGattBridge",
+        "updatedBy",
+        "updatedAt"
+      ]
+    },
+    "AnnouncementModule": {
+      "title": "AnnouncementModule",
+      "description": "Dynamic feature card, announcement, tip, or update item published by admin without coding.",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Card title."
+        },
+        "summary": {
+          "type": "string",
+          "description": "Card description body."
+        },
+        "category": {
+          "type": "string",
+          "enum": ["FEATURE", "UPDATE", "TIP", "USSD"],
+          "description": "Module category badge."
+        },
+        "actionLabel": {
+          "type": "string",
+          "description": "Optional action button text."
+        },
+        "actionValue": {
+          "type": "string",
+          "description": "Optional external URL or dial code."
+        },
+        "published": {
+          "type": "boolean",
+          "description": "Whether visible to general users."
+        },
+        "createdBy": {
+          "type": "string",
+          "description": "Creator admin UID."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "title",
+        "summary",
+        "category",
+        "published",
+        "createdBy",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User account profile, SIM labels, and server-managed subscription entitlement.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID."
+        },
+        "email": {
+          "type": "string",
+          "description": "User email address."
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User display name."
+        },
+        "photoUrl": {
+          "type": "string",
+          "description": "User avatar URL."
+        },
+        "sim1Label": {
+          "type": "string",
+          "description": "Custom label for SIM 1."
+        },
+        "sim2Label": {
+          "type": "string",
+          "description": "Custom label for SIM 2."
+        },
+        "hasActiveSubscription": {
+          "type": "boolean",
+          "description": "Subscription status managed by admin."
+        },
+        "subscriptionTier": {
+          "type": "string",
+          "enum": ["FREE", "MONTHLY", "YEARLY", "LIFETIME"],
+          "description": "Current subscription tier."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Account registration server timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Profile update server timestamp."
+        }
+      },
+      "required": [
+        "userId",
+        "email",
+        "displayName",
+        "sim1Label",
+        "sim2Label",
+        "hasActiveSubscription",
+        "subscriptionTier",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Admin authorization record.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "description": "Admin email."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp."
+        }
+      },
+      "required": ["email", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/app_config/{configId}": {
+      "schema": { "$ref": "#/entities/AppGlobalConfig" },
+      "description": "Global config document (primarily /app_config/global)."
+    },
+    "/announcements/{announcementId}": {
+      "schema": { "$ref": "#/entities/AnnouncementModule" },
+      "description": "Dynamic feature announcements and modules published by admin."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profiles and subscription status."
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Designated app administrators."
+    }
+  }
+}
