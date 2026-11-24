@@ -12,7 +12,14 @@ import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.work.Constraints
 import androidx.work.CoroutineWorker
+import androidx.work.ExistingWorkPolicy
+import androidx.work.ForegroundInfo
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
+import androidx.work.workDataOf
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
@@ -27,10 +34,8 @@ import com.example.data.remote.CloudAdminRepository
 import com.example.data.remote.PaymentRepository
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
+import com.google.firebase.firestore.FirebaseFirestoreException
+import kotlinx.coroutines.CancellationException
 import java.util.concurrent.TimeUnit
 
 /** Local notifications to the admin about new payment receipts, with a one-tap "Approve" action. */
@@ -69,14 +74,31 @@ object PaymentNotifications {
     @Synchronized
     fun notifyUnseen(context: Context, requests: List<PaymentRequest>): Int {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val seen = prefs.getStringSet(KEY_SEEN, emptySet())!!.toMutableSet()
+        // Entries are stored as "<seenAtMillis>:<id>" so trimming keeps the most recent ids
+        // (a HashSet has no order; legacy entries without a timestamp sort as oldest).
+        val seenAt = HashMap<String, Long>()
+        prefs.getStringSet(KEY_SEEN, emptySet()).orEmpty().forEach { entry ->
+            val sep = entry.indexOf(':')
+            if (sep > 0) {
+                val t = entry.substring(0, sep).toLongOrNull()
+                if (t != null) seenAt[entry.substring(sep + 1)] = t else seenAt[entry] = 0L
+            } else {
+                seenAt[entry] = 0L
+            }
+        }
         val fresh = requests.filter {
-            it.id.isNotBlank() && PaymentStatus.fromRaw(it.status) == PaymentStatus.PENDING && it.id !in seen
+            it.id.isNotBlank() && PaymentStatus.fromRaw(it.status) == PaymentStatus.PENDING && it.id !in seenAt
         }
         if (fresh.isEmpty()) return 0
         fresh.take(6).forEach { show(context, it) }
-        seen.addAll(fresh.map { it.id })
-        prefs.edit().putStringSet(KEY_SEEN, seen.toList().takeLast(500).toSet()).apply()
+        val now = System.currentTimeMillis()
+        fresh.forEach { seenAt[it.id] = now }
+        val kept = seenAt.entries
+            .sortedByDescending { it.value }
+            .take(500)
+            .map { "${it.value}:${it.key}" }
+            .toSet()
+        prefs.edit().putStringSet(KEY_SEEN, kept).apply()
         return fresh.size
     }
 
@@ -107,7 +129,7 @@ object PaymentNotifications {
             if (req.userEmail.isNotBlank()) append("\n${req.userEmail}")
         }
         val n = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(R.drawable.ic_stat_payment)
             .setContentTitle("فیش جدید از ${req.userName.ifBlank { "کاربر" }}")
             .setContentText("${plan.labelFa} • ${formatToman(req.amountToman)}")
             .setStyle(NotificationCompat.BigTextStyle().bigText(details))
@@ -128,7 +150,7 @@ object PaymentNotifications {
         if (!canPost(context)) return
         ensureChannel(context)
         val n = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(R.drawable.ic_stat_payment)
             .setContentTitle("eSkyTell • پرداخت‌ها")
             .setContentText(text)
             .setAutoCancel(true)
@@ -139,11 +161,24 @@ object PaymentNotifications {
         }
     }
 
+    fun progressNotification(context: Context): android.app.Notification {
+        ensureChannel(context)
+        return NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_payment)
+            .setContentTitle("eSkyTell • پرداخت‌ها")
+            .setContentText("در حال تایید پرداخت…")
+            .setOngoing(true)
+            .build()
+    }
+
     /** Background check every 15 minutes while the app is closed (admin only). */
     fun schedule(context: Context) {
-        val req = PeriodicWorkRequestBuilder<PendingPaymentsWorker>(15, TimeUnit.MINUTES).build()
+        val req = PeriodicWorkRequestBuilder<PendingPaymentsWorker>(15, TimeUnit.MINUTES)
+            .setConstraints(Constraints(requiredNetworkType = NetworkType.CONNECTED))
+            .build()
+        // UPDATE so installs that already scheduled the old (unconstrained) request pick up the constraint.
         WorkManager.getInstance(context.applicationContext)
-            .enqueueUniquePeriodicWork(WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, req)
+            .enqueueUniquePeriodicWork(WORK_NAME, ExistingPeriodicWorkPolicy.UPDATE, req)
     }
 
     fun cancel(context: Context) {
@@ -158,10 +193,56 @@ class PendingPaymentsWorker(appContext: Context, params: WorkerParameters) : Cor
             val pending = PaymentRepository(applicationContext).fetchPendingRequests()
             PaymentNotifications.notifyUnseen(applicationContext, pending)
             Result.success()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: FirebaseFirestoreException) {
+            // Permission problems will not fix themselves by retrying; wait for the next period.
+            if (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED ||
+                e.code == FirebaseFirestoreException.Code.UNAUTHENTICATED
+            ) Result.success() else Result.retry()
         } catch (_: Exception) {
             Result.retry()
         }
     }
+}
+
+/**
+ * Runs the notification "Approve" action outside the BroadcastReceiver, so a cold auth token fetch
+ * plus the Firestore transaction cannot be killed by the ~10 s broadcast deadline.
+ */
+class ApprovePaymentWorker(appContext: Context, params: WorkerParameters) : CoroutineWorker(appContext, params) {
+    companion object {
+        const val KEY_REQUEST_ID = "id"
+    }
+
+    override suspend fun doWork(): Result {
+        val id = inputData.getString(KEY_REQUEST_ID)?.takeIf { it.isNotBlank() } ?: return Result.failure()
+        val appCtx = applicationContext
+        if (!PaymentNotifications.isAdminSignedIn()) {
+            PaymentNotifications.showResult(appCtx, id, "برای تایید باید با حساب مدیر وارد باشید.")
+            return Result.success()
+        }
+        val res = try {
+            PaymentRepository(appCtx).approveById(id)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            kotlin.Result.failure<Unit>(e)
+        }
+        PaymentNotifications.showResult(
+            appCtx, id,
+            if (res.isSuccess) "تایید شد؛ اشتراک کاربر فعال شد."
+            else "تایید ناموفق: ${res.exceptionOrNull()?.message ?: "خطا"}"
+        )
+        return Result.success()
+    }
+
+    // Required for expedited work on API < 31.
+    override suspend fun getForegroundInfo(): ForegroundInfo =
+        ForegroundInfo(
+            PaymentNotifications.notificationId(inputData.getString(KEY_REQUEST_ID).orEmpty()),
+            PaymentNotifications.progressNotification(applicationContext)
+        )
 }
 
 class PaymentActionReceiver : BroadcastReceiver() {
@@ -173,23 +254,12 @@ class PaymentActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != ACTION_APPROVE) return
         val id = intent.getStringExtra(EXTRA_REQUEST_ID) ?: return
-        val pending = goAsync()
         val appCtx = context.applicationContext
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            try {
-                if (!PaymentNotifications.isAdminSignedIn()) {
-                    PaymentNotifications.showResult(appCtx, id, "برای تایید باید با حساب مدیر وارد باشید.")
-                } else {
-                    val res = PaymentRepository(appCtx).approveById(id)
-                    PaymentNotifications.showResult(
-                        appCtx, id,
-                        if (res.isSuccess) "تایید شد؛ اشتراک کاربر فعال شد."
-                        else "تایید ناموفق: ${res.exceptionOrNull()?.message ?: "خطا"}"
-                    )
-                }
-            } finally {
-                pending.finish()
-            }
-        }
+        val work = OneTimeWorkRequestBuilder<ApprovePaymentWorker>()
+            .setInputData(workDataOf(ApprovePaymentWorker.KEY_REQUEST_ID to id))
+            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            .build()
+        WorkManager.getInstance(appCtx)
+            .enqueueUniqueWork("approve_payment_$id", ExistingWorkPolicy.KEEP, work)
     }
 }

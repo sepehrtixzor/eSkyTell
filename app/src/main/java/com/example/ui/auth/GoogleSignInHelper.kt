@@ -77,27 +77,40 @@ fun onGoogleSignInClicked(
         onAuthError("پیکربندی ورود گوگل یافت نشد.")
         return
     }
-    val signInOption = GetSignInWithGoogleOption.Builder(serverClientId = clientId).build()
-    val request = GetCredentialRequest.Builder()
-        .addCredentialOption(signInOption)
-        .build()
     scope.launch {
-        try {
-            val activityContext = context as? Activity ?: context
+        val activityContext = context as? Activity ?: context
+        suspend fun signInWith(option: androidx.credentials.CredentialOption) {
+            val request = GetCredentialRequest.Builder().addCredentialOption(option).build()
             val cred = credentialManager.getCredential(activityContext, request).credential
             if (cred is CustomCredential && cred.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
                 val token = GoogleIdTokenCredential.createFrom(cred.data).idToken
                 Firebase.auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
-                onAuthSuccess()
             } else {
-                onAuthError("نوع اعتبارنامه‌ی دریافتی معتبر نیست.")
+                throw IllegalStateException("نوع اعتبارنامه‌ی دریافتی معتبر نیست.")
             }
+        }
+        try {
+            try {
+                // Bottom-sheet account picker (shows every Google account on the device)
+                signInWith(
+                    GetGoogleIdOption.Builder()
+                        .setFilterByAuthorizedAccounts(false)
+                        .setServerClientId(clientId)
+                        .setAutoSelectEnabled(false)
+                        .build()
+                )
+            } catch (first: GetCredentialCancellationException) {
+                throw first
+            } catch (first: androidx.credentials.exceptions.GetCredentialException) {
+                Log.w("Auth", "GoogleIdOption failed (${first.type}), trying Sign in with Google button flow", first)
+                signInWith(GetSignInWithGoogleOption.Builder(serverClientId = clientId).build())
+            }
+            onAuthSuccess()
         } catch (e: GetCredentialCancellationException) {
             Log.w("Auth", "Google Sign-In cancelled or dismissed: ${e.message}", e)
             onAuthCancelled()
         } catch (e: Exception) {
-            Log.e("Auth", "Google Sign-In failed", e)
-            onAuthError(e.localizedMessage ?: "خطا در ورود با حساب گوگل")
+            onAuthError(AuthErrors.describe(e))
         }
     }
 }

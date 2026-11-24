@@ -61,6 +61,7 @@ class TransferRepository(
 
     companion object {
         private const val BRIDGE_CHANNEL_ID = "eskytell_bridge_alerts"
+        private const val MAX_IMPORT_BYTES = 5_000_000
     }
 
     suspend fun addManualSms(
@@ -333,20 +334,43 @@ class TransferRepository(
         }
 
     suspend fun importFromUri(uri: Uri): ImportResult = withContext(Dispatchers.IO) {
-        val fileName = resolveFileName(uri) ?: "فایل پشتیبان"
-        val content = context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use {
-            it.readText()
+        val fileName = runCatching { resolveFileName(uri) }.getOrNull() ?: "فایل پشتیبان"
+        // Read with a hard byte cap; any IO/permission/OOM problem yields an empty result instead of a crash.
+        val content = try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                val out = java.io.ByteArrayOutputStream()
+                val buf = ByteArray(16 * 1024)
+                var total = 0
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    total += n
+                    if (total > MAX_IMPORT_BYTES) return@withContext ImportResult(0, 0, fileName)
+                    out.write(buf, 0, n)
+                }
+                String(out.toByteArray(), Charsets.UTF_8)
+            }
+        } catch (e: Exception) {
+            null
+        } catch (e: OutOfMemoryError) {
+            null
         } ?: return@withContext ImportResult(0, 0, fileName)
 
         val lowerName = fileName.lowercase(Locale.ROOT)
         val trimmed = content.trim()
-        return@withContext when {
-            lowerName.endsWith(".json") || trimmed.startsWith("{") -> parseJsonBundle(trimmed, fileName)
-            lowerName.endsWith(".xml") || trimmed.startsWith("<") -> parseXmlBackup(trimmed, fileName)
-            lowerName.endsWith(".vcf") || trimmed.contains("BEGIN:VCARD", ignoreCase = true) ->
-                parseVCard(trimmed, fileName)
-            lowerName.endsWith(".csv") -> parseCsv(trimmed, fileName)
-            else -> importSharedOrPastedText(trimmed, fileName)
+        return@withContext try {
+            when {
+                lowerName.endsWith(".json") || trimmed.startsWith("{") -> parseJsonBundle(trimmed, fileName)
+                lowerName.endsWith(".xml") || trimmed.startsWith("<") -> parseXmlBackup(trimmed, fileName)
+                lowerName.endsWith(".vcf") || trimmed.contains("BEGIN:VCARD", ignoreCase = true) ->
+                    parseVCard(trimmed, fileName)
+                lowerName.endsWith(".csv") -> parseCsv(trimmed, fileName)
+                else -> importSharedOrPastedText(trimmed, fileName)
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            ImportResult(0, 0, fileName)
         }
     }
 

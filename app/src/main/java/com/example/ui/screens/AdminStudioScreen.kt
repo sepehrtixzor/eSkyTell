@@ -43,6 +43,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
@@ -104,11 +106,14 @@ fun AdminStudioScreen(
     onApprovePayment: (PaymentRequest, String) -> Unit,
     onRejectPayment: (PaymentRequest, String) -> Unit,
     onDeletePayment: (String) -> Unit,
-    onClose: () -> Unit
+    onClose: () -> Unit,
+    snackbarHostState: SnackbarHostState? = null,
+    tabRequestTick: Int = 0
 ) {
     BackHandler { onClose() }
 
-    var selectedTab by remember(initialTab) { mutableIntStateOf(initialTab) }
+    // tabRequestTick lets a repeated "open payments" request switch tabs even if initialTab is unchanged.
+    var selectedTab by remember(initialTab, tabRequestTick) { mutableIntStateOf(initialTab) }
     var editingModule by remember { mutableStateOf<AnnouncementModule?>(null) }
     var showNewModuleDialog by remember { mutableStateOf(false) }
 
@@ -172,6 +177,7 @@ fun AdminStudioScreen(
     }
 
     Scaffold(
+        snackbarHost = { snackbarHostState?.let { SnackbarHost(hostState = it) } },
         topBar = {
             TopAppBar(
                 title = {
@@ -638,7 +644,7 @@ private fun UsersAdminTab(
             )
         }
 
-        items(filtered, key = { it.userId }) { user ->
+        items(filtered, key = { it.id.ifBlank { "u_" + it.userId + "_" + it.email } }) { user ->
             val currentTier = SubscriptionTier.fromRaw(user.subscriptionTier)
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),

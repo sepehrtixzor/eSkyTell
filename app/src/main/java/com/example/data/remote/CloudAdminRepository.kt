@@ -8,6 +8,7 @@ import com.example.data.model.AppGlobalConfig
 import com.example.data.model.SubscriptionTier
 import com.example.data.model.UserProfile
 import com.google.firebase.Firebase
+import com.google.firebase.Timestamp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.auth
@@ -23,6 +24,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
+import java.util.Date
 
 class CloudAdminRepository(
     private val db: FirebaseFirestore,
@@ -65,17 +67,7 @@ class CloudAdminRepository(
                         AppGlobalConfig()
                     }
                 }
-                .catch { error ->
-                    val firestoreError = generateSequence(error) { it.cause }
-                        .filterIsInstance<FirebaseFirestoreException>()
-                        .firstOrNull()
-                    if (firestoreError == null && error is CancellationException) throw error
-                    val exceptionToLog = firestoreError ?: (error as? Exception)
-                    if (exceptionToLog != null && auth.currentUser?.uid == uid) {
-                        handleFirestoreError(exceptionToLog, OperationType.GET, docRef.path)
-                    }
-                    emit(AppGlobalConfig())
-                }
+                .retryFirestoreListener(auth, uid, OperationType.GET, docRef.path) { AppGlobalConfig() }
         )
     }
 
@@ -92,17 +84,7 @@ class CloudAdminRepository(
                         DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
                     ).sortedByDescending { it.createdAt?.seconds ?: 0L }
                 }
-                .catch { error ->
-                    val firestoreError = generateSequence(error) { it.cause }
-                        .filterIsInstance<FirebaseFirestoreException>()
-                        .firstOrNull()
-                    if (firestoreError == null && error is CancellationException) throw error
-                    val exceptionToLog = firestoreError ?: (error as? Exception)
-                    if (exceptionToLog != null && auth.currentUser?.uid == uid) {
-                        handleFirestoreError(exceptionToLog, OperationType.LIST, path)
-                    }
-                    emit(emptyList())
-                }
+                .retryFirestoreListener(auth, uid, OperationType.LIST, path) { emptyList() }
         )
     }
 
@@ -118,17 +100,7 @@ class CloudAdminRepository(
                         DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
                     ).sortedByDescending { it.createdAt?.seconds ?: 0L }
                 }
-                .catch { error ->
-                    val firestoreError = generateSequence(error) { it.cause }
-                        .filterIsInstance<FirebaseFirestoreException>()
-                        .firstOrNull()
-                    if (firestoreError == null && error is CancellationException) throw error
-                    val exceptionToLog = firestoreError ?: (error as? Exception)
-                    if (exceptionToLog != null && auth.currentUser?.uid == uid) {
-                        handleFirestoreError(exceptionToLog, OperationType.LIST, path)
-                    }
-                    emit(emptyList())
-                }
+                .retryFirestoreListener(auth, uid, OperationType.LIST, path) { emptyList() }
         )
     }
 
@@ -146,17 +118,7 @@ class CloudAdminRepository(
                         )
                     } else null
                 }
-                .catch { error ->
-                    val firestoreError = generateSequence(error) { it.cause }
-                        .filterIsInstance<FirebaseFirestoreException>()
-                        .firstOrNull()
-                    if (firestoreError == null && error is CancellationException) throw error
-                    val exceptionToLog = firestoreError ?: (error as? Exception)
-                    if (exceptionToLog != null && auth.currentUser?.uid == uid) {
-                        handleFirestoreError(exceptionToLog, OperationType.GET, docRef.path)
-                    }
-                    emit(null)
-                }
+                .retryFirestoreListener(auth, uid, OperationType.GET, docRef.path) { null }
         )
     }
 
@@ -172,17 +134,7 @@ class CloudAdminRepository(
                         DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
                     ).sortedByDescending { it.updatedAt?.seconds ?: 0L }
                 }
-                .catch { error ->
-                    val firestoreError = generateSequence(error) { it.cause }
-                        .filterIsInstance<FirebaseFirestoreException>()
-                        .firstOrNull()
-                    if (firestoreError == null && error is CancellationException) throw error
-                    val exceptionToLog = firestoreError ?: (error as? Exception)
-                    if (exceptionToLog != null && auth.currentUser?.uid == uid) {
-                        handleFirestoreError(exceptionToLog, OperationType.LIST, path)
-                    }
-                    emit(emptyList())
-                }
+                .retryFirestoreListener(auth, uid, OperationType.LIST, path) { emptyList() }
         )
     }
 
@@ -407,13 +359,21 @@ class CloudAdminRepository(
         return try {
             requireUserId()
             require(targetUserId.isNotBlank()) { "شناسه کاربر نامعتبر است." }
-            db.collection("users").document(targetUserId).update(
-                mapOf(
-                    "hasActiveSubscription" to hasActiveSubscription,
-                    "subscriptionTier" to tier.name,
-                    "updatedAt" to FieldValue.serverTimestamp()
-                )
-            ).await()
+            val upd = mutableMapOf<String, Any>(
+                "hasActiveSubscription" to hasActiveSubscription,
+                "subscriptionTier" to tier.name,
+                "updatedAt" to FieldValue.serverTimestamp()
+            )
+            // Keep subscriptionExpiresAt consistent with the grant; otherwise an old, past expiry
+            // keeps the user locked even after the admin activates a plan.
+            if (tier == SubscriptionTier.LIFETIME || tier == SubscriptionTier.FREE || !hasActiveSubscription) {
+                upd["subscriptionExpiresAt"] = FieldValue.delete()
+            } else {
+                val days = if (tier == SubscriptionTier.YEARLY) 365L else 30L
+                upd["subscriptionExpiresAt"] =
+                    Timestamp(Date(System.currentTimeMillis() + days * 86_400_000L))
+            }
+            db.collection("users").document(targetUserId).update(upd).await()
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e

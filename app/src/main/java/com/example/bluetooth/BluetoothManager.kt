@@ -16,6 +16,7 @@ import android.bluetooth.BluetoothManager as AndroidBluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
@@ -50,8 +51,10 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -255,6 +258,11 @@ class BluetoothManager(private val context: Context) {
     private var serverTxCharacteristic: BluetoothGattCharacteristic? = null
     private var activeAdvertiseCallback: AdvertiseCallback? = null
     private val subscribedBleClients = ConcurrentHashMap<String, BluetoothDevice>()
+    // Per-client negotiated MTU on our GATT server (address -> ATT MTU). Default ATT MTU is 23.
+    private val serverClientMtu = ConcurrentHashMap<String, Int>()
+    // Android allows one notification in flight per server; completed from onNotificationSent.
+    @Volatile
+    private var pendingNotifyDeferred: CompletableDeferred<Int>? = null
 
     // Active BLE GATT Client state
     private var activeClientGatt: BluetoothGatt? = null
@@ -772,6 +780,14 @@ class BluetoothManager(private val context: Context) {
         negotiatedAttPayloadBytes = 20
 
         val remote = adapter.getRemoteDevice(device.address)
+        // GATT allows one outstanding operation: MTU request -> service discovery -> CCCD write are chained.
+        val servicesRequested = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun requestServiceDiscoveryOnce(g: BluetoothGatt) {
+            if (servicesRequested.compareAndSet(false, true)) {
+                val ok = runCatching { g.discoverServices() }.getOrDefault(false)
+                if (!ok) readyDeferred.complete(false)
+            }
+        }
         val gatt = remote.connectGatt(context, false, object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (status != BluetoothGatt.GATT_SUCCESS && newState != BluetoothProfile.STATE_CONNECTED) {
@@ -789,8 +805,16 @@ class BluetoothManager(private val context: Context) {
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
                         activeClientGatt = gatt
-                        runCatching { gatt.requestMtu(512) }
-                        gatt.discoverServices()
+                        val mtuRequested = runCatching { gatt.requestMtu(512) }.getOrDefault(false)
+                        if (!mtuRequested) {
+                            requestServiceDiscoveryOnce(gatt)
+                        } else {
+                            // Some stacks never deliver onMtuChanged; don't wait forever for it.
+                            scope.launch {
+                                delay(2_500L)
+                                if (!readyDeferred.isCompleted) requestServiceDiscoveryOnce(gatt)
+                            }
+                        }
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
                         readyDeferred.complete(false)
@@ -810,6 +834,19 @@ class BluetoothManager(private val context: Context) {
                 if (status == BluetoothGatt.GATT_SUCCESS && mtu > 23) {
                     negotiatedAttPayloadBytes = (mtu - 3).coerceIn(20, 480)
                 }
+                requestServiceDiscoveryOnce(gatt)
+            }
+
+            override fun onDescriptorWrite(
+                gatt: BluetoothGatt,
+                descriptor: BluetoothGattDescriptor,
+                status: Int
+            ) {
+                // The link is usable only once the CCCD write finished (even if it failed, writes
+                // to RX still work, so don't block the connection on it).
+                if (descriptor.uuid == CLIENT_CONFIG_DESCRIPTOR_UUID) {
+                    readyDeferred.complete(true)
+                }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -823,10 +860,10 @@ class BluetoothManager(private val context: Context) {
                 if (rxChar != null) {
                     activeClientRxChar = rxChar
                     activeBlePeerDevice = device.copy(isConnected = true, isBle = true)
-                    if (txChar != null) {
-                        enableBleTxNotifications(gatt, txChar)
-                    }
-                    readyDeferred.complete(true)
+                    // Ready is signalled from onDescriptorWrite; fall back to ready now when there is
+                    // no TX characteristic or the CCCD write could not be started.
+                    val cccdWritePending = txChar != null && enableBleTxNotifications(gatt, txChar)
+                    if (!cccdWritePending) readyDeferred.complete(true)
                 } else {
                     readyDeferred.complete(false)
                 }
@@ -861,7 +898,7 @@ class BluetoothManager(private val context: Context) {
             ) {
                 pendingGattWriteDeferred?.complete(status)
             }
-        })
+        }, BluetoothDevice.TRANSPORT_LE)
 
         if (gatt == null) {
             pendingGattConnectDeferred = null
@@ -891,13 +928,15 @@ class BluetoothManager(private val context: Context) {
         }
     }
 
+    /** Returns true when a CCCD write was issued (its result arrives in onDescriptorWrite). */
     @SuppressLint("MissingPermission")
-    private fun enableBleTxNotifications(gatt: BluetoothGatt, txChar: BluetoothGattCharacteristic) {
-        try {
+    private fun enableBleTxNotifications(gatt: BluetoothGatt, txChar: BluetoothGattCharacteristic): Boolean {
+        return try {
             gatt.setCharacteristicNotification(txChar, true)
-            val cccd = txChar.getDescriptor(CLIENT_CONFIG_DESCRIPTOR_UUID) ?: return
+            val cccd = txChar.getDescriptor(CLIENT_CONFIG_DESCRIPTOR_UUID) ?: return false
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                gatt.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ==
+                    BluetoothStatusCodes.SUCCESS
             } else {
                 @Suppress("DEPRECATION")
                 cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
@@ -905,6 +944,7 @@ class BluetoothManager(private val context: Context) {
                 gatt.writeDescriptor(cccd)
             }
         } catch (_: Exception) {
+            false
         }
     }
 
@@ -1125,25 +1165,62 @@ class BluetoothManager(private val context: Context) {
             return Result.failure(IllegalStateException("دستگاه متصل به سرور BLE وجود ندارد."))
         }
         val bytes = wirePayload.toByteArray(Charsets.UTF_8)
-        val frames = BleRelayFramer.encodeChunks(bytes, maxAttPayloadBytes = 180)
         return bleWriteMutex.withLock {
             try {
-                clients.forEach { device ->
-                    frames.forEach { frame ->
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            server.notifyCharacteristicChanged(device, txChar, false, frame)
-                        } else {
-                            @Suppress("DEPRECATION")
-                            txChar.value = frame
-                            @Suppress("DEPRECATION")
-                            server.notifyCharacteristicChanged(device, txChar, false)
+                var delivered = 0
+                var lastError: Exception? = null
+                for (device in clients) {
+                    // Frame size must fit this client's ATT MTU, or notifications get truncated.
+                    val attPayload = ((serverClientMtu[device.address] ?: 23) - 3).coerceIn(20, 480)
+                    val chunkCapacity = attPayload - BleRelayFramer.HEADER_SIZE
+                    if (chunkCapacity <= 0 || (bytes.size + chunkCapacity - 1) / chunkCapacity > 2048) {
+                        lastError = IllegalStateException("حجم بسته برای BLE زیاد است.")
+                        continue
+                    }
+                    val frames = BleRelayFramer.encodeChunks(bytes, maxAttPayloadBytes = attPayload)
+                    var ok = true
+                    for (frame in frames) {
+                        if (!notifyOneFrameAndAwait(server, device, txChar, frame)) {
+                            ok = false
+                            break
                         }
                     }
+                    if (ok) delivered++ else lastError = IOException("ارسال بسته BLE متوقف شد.")
                 }
-                Result.success(bytes.size.toLong())
+                if (delivered > 0) Result.success(bytes.size.toLong())
+                else Result.failure(lastError ?: IOException("ارسال بسته BLE متوقف شد."))
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Result.failure(e)
             }
+        }
+    }
+
+    /** Sends one notification and waits for onNotificationSent (with timeout). */
+    @SuppressLint("MissingPermission")
+    private suspend fun notifyOneFrameAndAwait(
+        server: BluetoothGattServer,
+        device: BluetoothDevice,
+        txChar: BluetoothGattCharacteristic,
+        frame: ByteArray
+    ): Boolean {
+        val deferred = CompletableDeferred<Int>()
+        pendingNotifyDeferred = deferred
+        try {
+            val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                server.notifyCharacteristicChanged(device, txChar, false, frame) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                txChar.value = frame
+                @Suppress("DEPRECATION")
+                server.notifyCharacteristicChanged(device, txChar, false)
+            }
+            if (!started) return false
+            val status = withTimeoutOrNull(3_000L) { deferred.await() } ?: return false
+            return status == BluetoothGatt.GATT_SUCCESS
+        } finally {
+            if (pendingNotifyDeferred === deferred) pendingNotifyDeferred = null
         }
     }
 
@@ -1244,6 +1321,7 @@ class BluetoothManager(private val context: Context) {
                         )
                     } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                         subscribedBleClients.remove(addr)
+                        serverClientMtu.remove(addr)
                         if (subscribedBleClients.isEmpty() && serverSocket != null) {
                             val localName = runCatching { bluetoothAdapter?.name }.getOrNull() ?: "این دستگاه"
                             _connectionState.value = RelayConnectionState.Listening(
@@ -1252,6 +1330,14 @@ class BluetoothManager(private val context: Context) {
                             )
                         }
                     }
+                }
+
+                override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+                    device.address?.let { serverClientMtu[it] = mtu }
+                }
+
+                override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+                    pendingNotifyDeferred?.complete(status)
                 }
 
                 override fun onDescriptorWriteRequest(
@@ -1409,6 +1495,9 @@ class BluetoothManager(private val context: Context) {
         gattServer = null
         serverTxCharacteristic = null
         subscribedBleClients.clear()
+        serverClientMtu.clear()
+        pendingNotifyDeferred?.complete(BluetoothGatt.GATT_FAILURE)
+        pendingNotifyDeferred = null
     }
 
     private fun closeActiveRfcommClient() {
@@ -1481,29 +1570,32 @@ class BluetoothManager(private val context: Context) {
             isConnected = activePeerDevice?.address == address || activeBlePeerDevice?.address == address
         )
 
-        val current = _nearbyDevices.value.toMutableList()
-        val existingIdx = current.indexOfFirst { it.address == address }
-        if (existingIdx >= 0) {
-            val existing = current[existingIdx]
-            val betterName = if (existing.name.startsWith("دستگاه") && !item.name.startsWith("دستگاه")) {
-                item.name
+        // Atomic read-modify-write: called from both the BLE scan binder thread and the main thread.
+        _nearbyDevices.update { snapshot ->
+            val current = snapshot.toMutableList()
+            val existingIdx = current.indexOfFirst { it.address == address }
+            if (existingIdx >= 0) {
+                val existing = current[existingIdx]
+                val betterName = if (existing.name.startsWith("دستگاه") && !item.name.startsWith("دستگاه")) {
+                    item.name
+                } else {
+                    existing.name
+                }
+                val betterPlatform = if (existing.platform == DevicePlatform.OTHER) item.platform else existing.platform
+                current[existingIdx] = item.copy(
+                    name = betterName,
+                    platform = betterPlatform,
+                    rssi = rssi ?: existing.rssi
+                )
             } else {
-                existing.name
+                current.add(item)
             }
-            val betterPlatform = if (existing.platform == DevicePlatform.OTHER) item.platform else existing.platform
-            current[existingIdx] = item.copy(
-                name = betterName,
-                platform = betterPlatform,
-                rssi = rssi ?: existing.rssi
+            current.sortedWith(
+                compareByDescending<DiscoveredBluetoothDevice> {
+                    it.platform == DevicePlatform.IPHONE || it.platform == DevicePlatform.ANDROID
+                }.thenByDescending { it.rssi ?: -200 }
             )
-        } else {
-            current.add(item)
         }
-        _nearbyDevices.value = current.sortedWith(
-            compareByDescending<DiscoveredBluetoothDevice> {
-                it.platform == DevicePlatform.IPHONE || it.platform == DevicePlatform.ANDROID
-            }.thenByDescending { it.rssi ?: -200 }
-        )
     }
 
     @SuppressLint("MissingPermission")
@@ -1567,7 +1659,8 @@ class BluetoothManager(private val context: Context) {
             context,
             discoveryReceiver,
             filter,
-            ContextCompat.RECEIVER_EXPORTED
+            // System (protected) broadcasts are still delivered; other apps can no longer spoof them.
+            ContextCompat.RECEIVER_NOT_EXPORTED
         )
         receiverRegistered = true
     }

@@ -6,6 +6,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
@@ -47,7 +48,9 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -59,6 +62,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.credentials.CredentialManager
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavGraph.Companion.findStartDestination
@@ -115,7 +121,34 @@ object AdminPaymentsNavSignal {
     val openTick = MutableStateFlow(0)
 }
 
+/**
+ * Activity-scoped holder (survives rotation) that gives each signed-in uid its own ViewModelStore,
+ * so the per-user MainViewModel can be cleared when that user signs out or another user signs in.
+ */
+class UserScopedStores : ViewModel() {
+    private val stores = HashMap<String, ViewModelStore>()
+
+    fun ownerFor(uid: String): ViewModelStoreOwner {
+        val store = stores.getOrPut(uid) { ViewModelStore() }
+        return object : ViewModelStoreOwner {
+            override val viewModelStore: ViewModelStore = store
+        }
+    }
+
+    fun retainOnly(uid: String?) {
+        val stale = stores.keys.filter { it != uid }
+        stale.forEach { stores.remove(it)?.clear() }
+    }
+
+    override fun onCleared() {
+        stores.values.forEach { it.clear() }
+        stores.clear()
+    }
+}
+
 class MainActivity : ComponentActivity() {
+
+    private val userScopes: UserScopedStores by viewModels()
 
     private val pendingSharedText = MutableStateFlow<String?>(null)
     private val resumeTick = MutableStateFlow(0)
@@ -132,6 +165,15 @@ class MainActivity : ComponentActivity() {
             val resumeCount by resumeTick.collectAsStateWithLifecycle()
             var isDarkTheme by remember { mutableStateOf(true) }
 
+            // Clear ViewModels (and their BluetoothManager, receivers, servers, listeners) of any
+            // user that is no longer signed in, on sign-out or account switch.
+            LaunchedEffect(currentUser?.uid) {
+                userScopes.retainOnly(currentUser?.uid)
+                if (currentUser == null) {
+                    com.example.payments.PaymentNotifications.cancel(applicationContext)
+                }
+            }
+
             ESkyTellTheme(darkTheme = isDarkTheme) {
                 CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
                     val user = currentUser
@@ -139,6 +181,7 @@ class MainActivity : ComponentActivity() {
                         AuthScreen(onAuthSuccess = {})
                     } else {
                         key(user.uid) {
+                            val userOwner = remember { userScopes.ownerFor(user.uid) }
                             val isAdmin = remember(user.email) {
                                 CloudAdminRepository.BOOTSTRAPPED_ADMIN_EMAIL.equals(
                                     user.email?.trim(),
@@ -146,6 +189,7 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                             val vm: MainViewModel = viewModel(
+                                viewModelStoreOwner = userOwner,
                                 key = user.uid,
                                 factory = MainViewModel.factory(
                                     context = applicationContext,
@@ -220,13 +264,17 @@ fun ESkyTellApp(viewModel: MainViewModel) {
     var showPermissionsSheet by remember { mutableStateOf(false) }
     var showHistorySheet by remember { mutableStateOf(false) }
     var showAdminStudio by remember { mutableStateOf(false) }
-    var adminInitialTab by remember { mutableStateOf(0) }
+    var adminInitialTab by rememberSaveable { mutableStateOf(0) }
+    var adminTabRequestTick by rememberSaveable { mutableStateOf(0) }
     val paymentState by viewModel.paymentState.collectAsStateWithLifecycle()
     val openPaymentsTick by AdminPaymentsNavSignal.openTick.collectAsStateWithLifecycle()
     LaunchedEffect(openPaymentsTick, uiState.isAdmin) {
         if (openPaymentsTick > 0 && uiState.isAdmin) {
             adminInitialTab = 3
+            adminTabRequestTick += 1
             showAdminStudio = true
+            // Consume the one-shot signal so a rotation/recomposition does not reopen the studio.
+            AdminPaymentsNavSignal.openTick.value = 0
         }
     }
     val notifPermissionLauncher = rememberLauncherForActivityResult(
@@ -298,22 +346,31 @@ fun ESkyTellApp(viewModel: MainViewModel) {
             onApprovePayment = viewModel::approvePaymentRequest,
             onRejectPayment = viewModel::rejectPaymentRequest,
             onDeletePayment = viewModel::deletePaymentRequest,
-            onClose = { showAdminStudio = false; adminInitialTab = 0 }
+            onClose = { showAdminStudio = false; adminInitialTab = 0 },
+            snackbarHostState = snackbarHostState,
+            tabRequestTick = adminTabRequestTick
         )
         return
     }
 
     val activeCall = uiState.activeCall
     if (activeCall != null) {
-        ActiveBridgeCallOverlay(
-            activeCall = activeCall,
-            simLabel = uiState.activeSimLabel,
-            onToggleMute = viewModel::toggleActiveCallMute,
-            onToggleSpeaker = viewModel::toggleActiveCallSpeaker,
-            onToggleBluetoothAudio = viewModel::toggleActiveCallBluetoothAudio,
-            onLaunchSystemDialer = { viewModel.placeSystemDialerCall(activeCall.phoneNumber) },
-            onEndCall = viewModel::endActiveBridgeCall
-        )
+        Box(modifier = Modifier.fillMaxSize()) {
+            ActiveBridgeCallOverlay(
+                activeCall = activeCall,
+                simLabel = uiState.activeSimLabel,
+                onToggleMute = viewModel::toggleActiveCallMute,
+                onToggleSpeaker = viewModel::toggleActiveCallSpeaker,
+                onToggleBluetoothAudio = viewModel::toggleActiveCallBluetoothAudio,
+                onLaunchSystemDialer = { viewModel.placeSystemDialerCall(activeCall.phoneNumber) },
+                onEndCall = viewModel::endActiveBridgeCall
+            )
+            // Keep a SnackbarHost on screen so showSnackbar() does not suspend while the overlay is up.
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp)
+            )
+        }
         return
     }
 

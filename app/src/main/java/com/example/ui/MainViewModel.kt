@@ -43,6 +43,7 @@ import com.example.data.model.PaymentConfig
 import com.example.data.model.PaymentMethod
 import com.example.data.model.PaymentPlan
 import com.example.data.model.PaymentRequest
+import com.example.data.model.PaymentStatus
 import com.example.data.repository.TransferRepository
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
@@ -63,6 +64,8 @@ import kotlinx.coroutines.launch
 
 data class PaymentUiState(
     val config: PaymentConfig = PaymentConfig(),
+    /** True only once the real admin config document has been loaded (never for fallback defaults). */
+    val configLoaded: Boolean = false,
     val myRequests: List<PaymentRequest> = emptyList(),
     val adminRequests: List<PaymentRequest> = emptyList(),
     val isSubmitting: Boolean = false,
@@ -1091,14 +1094,21 @@ class MainViewModel(
         _paymentSubmitting,
         _paymentSubmitTick
     ) { cfg, mine, all, submitting, tick ->
-        PaymentUiState(cfg, mine, all, submitting, tick)
+        PaymentUiState(
+            config = cfg ?: PaymentConfig(),
+            configLoaded = cfg != null,
+            myRequests = mine,
+            adminRequests = all,
+            isSubmitting = submitting,
+            submitSuccessTick = tick
+        )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), PaymentUiState())
 
     init {
         if (isAdmin) {
             com.example.payments.PaymentNotifications.schedule(appContext)
             viewModelScope.launch {
-                paymentRepository.observeAllRequestsForAdmin().collect { list ->
+                paymentRepository.observePendingRequestsForAdmin().collect { list ->
                     com.example.payments.PaymentNotifications.notifyUnseen(appContext, list)
                 }
             }
@@ -1112,8 +1122,18 @@ class MainViewModel(
         trackingCode: String,
         imageUri: Uri?
     ) {
+        if (_paymentSubmitting.value) return
+        val stateNow = paymentState.value
+        if (!stateNow.configLoaded) {
+            _snackbarMessage.value = "تنظیمات پرداخت هنوز دریافت نشده است. چند لحظه بعد دوباره تلاش کنید."
+            return
+        }
+        if (stateNow.myRequests.any { PaymentStatus.fromRaw(it.status) == PaymentStatus.PENDING }) {
+            _snackbarMessage.value = "یک فیش در انتظار بررسی دارید."
+            return
+        }
+        _paymentSubmitting.value = true
         viewModelScope.launch {
-            _paymentSubmitting.value = true
             val base64 = if (imageUri != null) {
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                     runCatching { compressReceiptImage(imageUri) }.getOrNull()

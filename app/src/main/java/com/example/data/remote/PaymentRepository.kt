@@ -16,7 +16,12 @@ import com.google.firebase.auth.auth
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.Source
 import com.google.firebase.firestore.snapshots
+import com.example.data.model.SubscriptionTier
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -40,18 +45,27 @@ class PaymentRepository(
         )
     )
 
+    companion object {
+        const val ADMIN_HISTORY_LIMIT = 50L
+    }
+
     private val configRef get() = db.collection("payment_config").document("main")
     private val requestsCol get() = db.collection("payment_requests")
 
-    fun observeConfig(): Flow<PaymentConfig> =
+    /**
+     * Emits the real admin-configured payment config, or null while it is not (yet) available.
+     * Errors never produce fake defaults: the listener retries with backoff instead, so the UI can keep
+     * the submit button disabled until real prices/cards are known.
+     */
+    fun observeConfig(): Flow<PaymentConfig?> =
         configRef.snapshots()
-            .map { snap ->
+            .map<DocumentSnapshot, PaymentConfig?> { snap ->
                 if (snap.exists()) {
                     snap.toObject(PaymentConfig::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-                        ?: PaymentConfig()
-                } else PaymentConfig()
+                } else null
             }
-            .catch { e -> if (e is CancellationException) throw e; emit(PaymentConfig()) }
+            .retryFirestoreListener(auth, auth.currentUser?.uid, OperationType.GET, "payment_config/main")
+            .onStart { emit(null) }
 
     fun observeMyRequests(userId: String): Flow<List<PaymentRequest>> =
         requestsCol.whereEqualTo("userId", userId)
@@ -60,15 +74,38 @@ class PaymentRepository(
                 snap.toObjects(PaymentRequest::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
                     .sortedByDescending { it.createdAt?.seconds ?: Long.MAX_VALUE }
             }
-            .catch { e -> if (e is CancellationException) throw e; emit(emptyList()) }
+            .retryFirestoreListener(auth, userId, OperationType.LIST, "payment_requests")
+            .onStart { emit(emptyList()) }
 
-    fun observeAllRequestsForAdmin(): Flow<List<PaymentRequest>> =
-        requestsCol.snapshots()
+    /** Only PENDING requests (no history), for admin notifications. */
+    fun observePendingRequestsForAdmin(): Flow<List<PaymentRequest>> =
+        requestsCol.whereEqualTo("status", PaymentStatus.PENDING.name)
+            .snapshots()
             .map { snap ->
                 snap.toObjects(PaymentRequest::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-                    .sortedByDescending { it.createdAt?.seconds ?: Long.MAX_VALUE }
             }
-            .catch { e -> if (e is CancellationException) throw e; emit(emptyList()) }
+            .retryFirestoreListener(auth, auth.currentUser?.uid, OperationType.LIST, "payment_requests")
+
+    /**
+     * Admin list: every PENDING request plus only the most recent [ADMIN_HISTORY_LIMIT] requests of
+     * history, instead of downloading every receipt ever submitted on each snapshot.
+     */
+    fun observeAllRequestsForAdmin(): Flow<List<PaymentRequest>> {
+        val recent = requestsCol
+            .orderBy("createdAt", Query.Direction.DESCENDING)
+            .limit(ADMIN_HISTORY_LIMIT)
+            .snapshots()
+            .map { snap ->
+                snap.toObjects(PaymentRequest::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            }
+            .retryFirestoreListener(auth, auth.currentUser?.uid, OperationType.LIST, "payment_requests")
+            .onStart { emit(emptyList()) }
+        val pending = observePendingRequestsForAdmin().onStart { emit(emptyList()) }
+        return combine(pending, recent) { p, r ->
+            (p + r).distinctBy { it.id }
+                .sortedByDescending { it.createdAt?.seconds ?: Long.MAX_VALUE }
+        }
+    }
 
     suspend fun saveConfig(
         monthlyToman: Long,
@@ -149,10 +186,13 @@ class PaymentRepository(
                 throw IllegalStateException("این درخواست قبلاً بررسی شده است.")
             }
             val userSnap = tx.get(userRef)
+            if (!userSnap.exists()) throw IllegalStateException("پروفایل کاربر یافت نشد.")
+            val isLifetime = userSnap.getString("subscriptionTier") == SubscriptionTier.LIFETIME.name
             val plan = PaymentPlan.fromRaw(reqSnap.getString("plan") ?: request.plan)
             val now = Date()
+            val isActive = userSnap.getBoolean("hasActiveSubscription") == true
             val currentExpiry = userSnap.getTimestamp("subscriptionExpiresAt")?.toDate()
-            val base = if (currentExpiry != null && currentExpiry.after(now)) currentExpiry else now
+            val base = if (isActive && currentExpiry != null && currentExpiry.after(now)) currentExpiry else now
             val newExpiry = Date(base.time + plan.days * 24L * 60L * 60L * 1000L)
             tx.update(
                 reqRef, mapOf(
@@ -162,7 +202,8 @@ class PaymentRepository(
                     "reviewedAt" to FieldValue.serverTimestamp()
                 )
             )
-            if (userSnap.exists()) {
+            // A LIFETIME user keeps LIFETIME (no downgrade to a dated plan).
+            if (!isLifetime) {
                 tx.update(
                     userRef, mapOf(
                         "hasActiveSubscription" to true,
@@ -177,10 +218,10 @@ class PaymentRepository(
     }
 
     suspend fun fetchRequest(id: String): PaymentRequest? =
-        requestsCol.document(id).get().await().toObject(PaymentRequest::class.java)
+        requestsCol.document(id).get(Source.SERVER).await().toObject(PaymentRequest::class.java)
 
     suspend fun fetchPendingRequests(): List<PaymentRequest> =
-        requestsCol.whereEqualTo("status", PaymentStatus.PENDING.name).get().await()
+        requestsCol.whereEqualTo("status", PaymentStatus.PENDING.name).get(Source.SERVER).await()
             .toObjects(PaymentRequest::class.java)
 
     suspend fun approveById(id: String): Result<Unit> {

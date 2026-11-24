@@ -42,6 +42,14 @@
         android:name="android.hardware.bluetooth_le"
         android:required="false" />
 
+    <!-- Package visibility (API 30+): lets queryIntentActivities(ACTION_SEND) find the Bluetooth share target. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="*/*" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"

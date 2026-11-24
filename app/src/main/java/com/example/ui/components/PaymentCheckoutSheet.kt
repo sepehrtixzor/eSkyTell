@@ -232,7 +232,16 @@ fun PaymentCheckoutSheet(
                 Text(if (imageUri != null) "تصویر فیش انتخاب شد (تغییر)" else "آپلود تصویر فیش (اختیاری)")
             }
 
-            val canSubmit = (trackingCode.isNotBlank() || imageUri != null) && !paymentState.isSubmitting
+            val configReady = paymentState.configLoaded
+            val destinationOk = selectedDestination.isNotBlank() ||
+                (activeCards.isEmpty() && activeWallets.isEmpty())
+            val canSubmit = configReady && !hasPending && !paymentState.isSubmitting &&
+                (trackingCode.isNotBlank() || imageUri != null) && destinationOk
+            if (!configReady) {
+                InfoBox("در حال دریافت تنظیمات پرداخت… لطفاً چند لحظه صبر کنید.")
+            } else if (!destinationOk && !hasPending) {
+                InfoBox("ابتدا کارت یا کیف پول مقصد را انتخاب کنید.")
+            }
             Button(
                 onClick = {
                     onSubmit(plan, method, selectedDestination, trackingCode, imageUri)

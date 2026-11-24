@@ -357,12 +357,31 @@ private fun EmailAuthCard(
     var password by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
 
-    fun mapError(e: Exception): String = when (e) {
-        is FirebaseAuthWeakPasswordException -> "رمز عبور باید حداقل ۶ کاراکتر باشد."
-        is FirebaseAuthUserCollisionException -> "این ایمیل قبلاً ثبت شده است. وارد شوید."
-        is FirebaseAuthInvalidUserException -> "حسابی با این ایمیل پیدا نشد."
-        is FirebaseAuthInvalidCredentialsException -> "ایمیل یا رمز عبور اشتباه است."
-        else -> "خطا: ${e.localizedMessage ?: "ارتباط برقرار نشد"}"
+    fun mapError(e: Exception): String = AuthErrors.describe(e)
+    var showReset by remember { mutableStateOf(false) }
+
+    if (showReset) {
+        PasswordResetDialog(
+            initialEmail = email,
+            onDismiss = { showReset = false },
+            onResetDone = { resetEmail, newPassword ->
+                showReset = false
+                email = resetEmail
+                password = newPassword
+                scope.launch {
+                    onBusy(true)
+                    try {
+                        Firebase.auth.signInWithEmailAndPassword(resetEmail, newPassword).await()
+                        onInfo("رمز عبور تغییر کرد و وارد شدید.")
+                        onAuthSuccess()
+                    } catch (e: Exception) {
+                        onInfo("رمز عبور تغییر کرد. اکنون با رمز جدید وارد شوید.")
+                    } finally {
+                        onBusy(false)
+                    }
+                }
+            }
+        )
     }
 
     Card(
@@ -422,10 +441,11 @@ private fun EmailAuthCard(
                         onBusy(true)
                         try {
                             if (isRegister) {
-                                val res = Firebase.auth.createUserWithEmailAndPassword(email, password).await()
+                                val res = Firebase.auth.createUserWithEmailAndPassword(email.lowercase(), password).await()
                                 runCatching { res.user?.sendEmailVerification()?.await() }
+                                onInfo("حساب ساخته شد. لینک تأیید به ایمیل شما ارسال شد.")
                             } else {
-                                Firebase.auth.signInWithEmailAndPassword(email, password).await()
+                                Firebase.auth.signInWithEmailAndPassword(email.lowercase(), password).await()
                             }
                             onAuthSuccess()
                         } catch (e: Exception) {
@@ -442,26 +462,161 @@ private fun EmailAuthCard(
                 Text(if (isRegister) "ثبت‌نام" else "ورود", fontWeight = FontWeight.Bold)
             }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                TextButton(onClick = { isRegister = !isRegister; onError(null) }) {
+                TextButton(onClick = { isRegister = !isRegister; confirm = ""; onError(null); onInfo(null) }) {
                     Text(if (isRegister) "حساب دارید؟ ورود" else "حساب ندارید؟ ثبت‌نام")
                 }
                 if (!isRegister) {
                     TextButton(onClick = {
                         onError(null); onInfo(null)
-                        if (!android.util.Patterns.EMAIL_ADDRESS.matcher(email).matches()) {
-                            onError("برای بازیابی، ابتدا ایمیل را وارد کنید."); return@TextButton
-                        }
-                        scope.launch {
-                            try {
-                                Firebase.auth.sendPasswordResetEmail(email).await()
-                                onInfo("لینک بازیابی رمز به ایمیل شما ارسال شد.")
-                            } catch (e: Exception) {
-                                onError(mapError(e))
-                            }
-                        }
+                        showReset = true
                     }) { Text("فراموشی رمز") }
                 }
             }
         }
     }
+}
+
+
+@Composable
+private fun PasswordResetDialog(
+    initialEmail: String,
+    onDismiss: () -> Unit,
+    onResetDone: (email: String, newPassword: String) -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    var step by remember { mutableStateOf(0) }
+    var resetEmail by remember { mutableStateOf(initialEmail.trim()) }
+    var linkOrCode by remember { mutableStateOf("") }
+    var newPass by remember { mutableStateOf("") }
+    var newPass2 by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var info by remember { mutableStateOf<String?>(null) }
+
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text(if (step == 0) "بازیابی رمز عبور" else "تعیین رمز جدید") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (step == 0) {
+                    Text(
+                        "ایمیل حساب را وارد کنید تا لینک بازیابی برایتان ارسال شود.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    OutlinedTextField(
+                        value = resetEmail,
+                        onValueChange = { resetEmail = it.trim() },
+                        label = { Text("ایمیل") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    Text(
+                        "ایمیل بازیابی ارسال شد (پوشه اسپم را هم ببینید). روی لینک داخل ایمیل نزنید؛ انگشت را روی لینک نگه دارید، «کپی لینک» را بزنید و اینجا بچسبانید. سپس رمز جدید را وارد کنید.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    OutlinedTextField(
+                        value = linkOrCode,
+                        onValueChange = { linkOrCode = it },
+                        label = { Text("لینک یا کد بازیابی از ایمیل") },
+                        maxLines = 3,
+                        trailingIcon = {
+                            TextButton(onClick = {
+                                clipboard.getText()?.text?.let { linkOrCode = it }
+                            }) { Text("چسباندن") }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = newPass,
+                        onValueChange = { newPass = it },
+                        label = { Text("رمز جدید (حداقل ۶ کاراکتر)") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = newPass2,
+                        onValueChange = { newPass2 = it },
+                        label = { Text("تکرار رمز جدید") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    TextButton(
+                        enabled = !busy,
+                        onClick = {
+                            error = null
+                            scope.launch {
+                                busy = true
+                                try {
+                                    Firebase.auth.sendPasswordResetEmail(resetEmail.lowercase()).await()
+                                    info = "ایمیل بازیابی دوباره ارسال شد."
+                                } catch (e: Exception) {
+                                    error = AuthErrors.describe(e)
+                                } finally {
+                                    busy = false
+                                }
+                            }
+                        }
+                    ) { Text("ارسال دوباره ایمیل") }
+                }
+                info?.let { Text(it, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall) }
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                if (busy) {
+                    androidx.compose.material3.LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = !busy,
+                onClick = {
+                    error = null; info = null
+                    if (step == 0) {
+                        if (!android.util.Patterns.EMAIL_ADDRESS.matcher(resetEmail).matches()) {
+                            error = "ایمیل معتبر وارد کنید."; return@Button
+                        }
+                        scope.launch {
+                            busy = true
+                            try {
+                                Firebase.auth.sendPasswordResetEmail(resetEmail.lowercase()).await()
+                                step = 1
+                            } catch (e: Exception) {
+                                error = AuthErrors.describe(e)
+                            } finally {
+                                busy = false
+                            }
+                        }
+                    } else {
+                        val code = AuthErrors.extractOobCode(linkOrCode)
+                        when {
+                            code == null -> { error = "لینک یا کد بازیابی را از ایمیل کپی و اینجا بچسبانید."; return@Button }
+                            newPass.length < 6 -> { error = "رمز جدید باید حداقل ۶ کاراکتر باشد."; return@Button }
+                            newPass != newPass2 -> { error = "تکرار رمز یکسان نیست."; return@Button }
+                        }
+                        scope.launch {
+                            busy = true
+                            try {
+                                val accountEmail = Firebase.auth.verifyPasswordResetCode(code!!).await()
+                                Firebase.auth.confirmPasswordReset(code, newPass).await()
+                                onResetDone(accountEmail ?: resetEmail, newPass)
+                            } catch (e: Exception) {
+                                error = AuthErrors.describe(e)
+                            } finally {
+                                busy = false
+                            }
+                        }
+                    }
+                }
+            ) { Text(if (step == 0) "ارسال لینک بازیابی" else "ثبت رمز جدید") }
+        },
+        dismissButton = {
+            TextButton(enabled = !busy, onClick = onDismiss) { Text("بستن") }
+        }
+    )
 }
