@@ -76,6 +76,7 @@ service cloud.firestore {
              data.sim1Label is string && data.sim1Label.size() >= 1 && data.sim1Label.size() <= 40 &&
              data.sim2Label is string && data.sim2Label.size() >= 1 && data.sim2Label.size() <= 40 &&
              data.hasActiveSubscription is bool &&
+             (!('subscriptionExpiresAt' in data) || data.subscriptionExpiresAt is timestamp) &&
              data.subscriptionTier in ['FREE', 'MONTHLY', 'YEARLY', 'LIFETIME'] &&
              data.createdAt is timestamp && data.createdAt <= request.time &&
              data.updatedAt is timestamp && data.updatedAt <= request.time;
@@ -180,7 +181,7 @@ service cloud.firestore {
                        incoming().createdAt == existing().createdAt &&
                        (
                          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly([
-                           'hasActiveSubscription', 'subscriptionTier', 'updatedAt'
+                           'hasActiveSubscription', 'subscriptionTier', 'subscriptionExpiresAt', 'updatedAt'
                          ])) ||
                          (request.auth.uid == userId &&
                            incoming().hasActiveSubscription == existing().hasActiveSubscription &&
@@ -191,6 +192,60 @@ service cloud.firestore {
                          )
                        );
       allow delete: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+    }
+
+    // Manual payment settings: cards, crypto wallets, toman prices (/payment_config/main)
+    match /payment_config/{docId} {
+      allow get: if isSignedIn() && docId == 'main';
+      allow list: if false;
+      allow create, update: if isAdmin() && docId == 'main' &&
+                               incoming().keys().hasOnly([
+                                 'monthlyPriceToman', 'yearlyPriceToman', 'instructions',
+                                 'cards', 'wallets', 'updatedAt'
+                               ]) &&
+                               incoming().monthlyPriceToman is int && incoming().monthlyPriceToman >= 0 &&
+                               incoming().yearlyPriceToman is int && incoming().yearlyPriceToman >= 0 &&
+                               incoming().instructions is string && incoming().instructions.size() <= 800 &&
+                               incoming().cards is list && incoming().cards.size() <= 20 &&
+                               incoming().wallets is list && incoming().wallets.size() <= 20;
+      allow delete: if false;
+    }
+
+    // Payment receipts submitted by users, reviewed by admin (/payment_requests/{id})
+    match /payment_requests/{requestId} {
+      allow get: if isSignedIn() && isValidId(requestId) &&
+                    (existing().userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() &&
+                     (existing().userId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isSignedIn() &&
+                       isValidId(requestId) &&
+                       incoming().userId == request.auth.uid &&
+                       incoming().status == 'PENDING' &&
+                       incoming().keys().hasAll([
+                         'userId', 'userEmail', 'userName', 'plan', 'amountToman', 'method',
+                         'destination', 'trackingCode', 'receiptImage', 'status', 'createdAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'userEmail', 'userName', 'plan', 'amountToman', 'method',
+                         'destination', 'trackingCode', 'receiptImage', 'status', 'createdAt'
+                       ]) &&
+                       incoming().plan in ['MONTHLY', 'YEARLY'] &&
+                       incoming().method in ['CARD', 'CRYPTO'] &&
+                       incoming().amountToman is int && incoming().amountToman >= 0 &&
+                       incoming().userEmail is string && incoming().userEmail.size() <= 200 &&
+                       incoming().userName is string && incoming().userName.size() <= 100 &&
+                       incoming().destination is string && incoming().destination.size() <= 250 &&
+                       incoming().trackingCode is string && incoming().trackingCode.size() <= 100 &&
+                       incoming().receiptImage is string && incoming().receiptImage.size() <= 900000 &&
+                       (incoming().trackingCode.size() > 0 || incoming().receiptImage.size() > 0) &&
+                       incoming().createdAt == request.time;
+      allow update: if isAdmin() &&
+                       existing().status == 'PENDING' &&
+                       incoming().status in ['APPROVED', 'REJECTED'] &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'status', 'adminNote', 'reviewedBy', 'reviewedAt'
+                       ]);
+      allow delete: if isAdmin();
     }
 
     // Admin roster

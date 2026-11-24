@@ -85,6 +85,7 @@ data class UserProfile(
     val sim2Label: String = "SIM 2 • خط شخصی",
     val hasActiveSubscription: Boolean = false,
     val subscriptionTier: String = SubscriptionTier.FREE.name,
+    val subscriptionExpiresAt: Timestamp? = null,
     val createdAt: Timestamp? = null,
     val updatedAt: Timestamp? = null
 )

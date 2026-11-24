@@ -74,6 +74,7 @@ import com.example.ui.components.ActiveBridgeCallOverlay
 import com.example.ui.components.HistoryBottomSheet
 import com.example.ui.components.IphoneGuideSheet
 import com.example.ui.components.PaywallBottomSheet
+import com.example.ui.components.PaymentCheckoutSheet
 import com.example.ui.components.PermissionsManagerSheet
 import com.example.ui.screens.AdminStudioScreen
 import com.example.ui.screens.BridgeHubScreen
@@ -108,6 +109,10 @@ private fun FirebaseAuth.authStateFlow() = callbackFlow<FirebaseUser?> {
     }
     addAuthStateListener(listener)
     awaitClose { removeAuthStateListener(listener) }
+}
+
+object AdminPaymentsNavSignal {
+    val openTick = MutableStateFlow(0)
 }
 
 class MainActivity : ComponentActivity() {
@@ -184,6 +189,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun captureSharedIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(com.example.payments.PaymentNotifications.EXTRA_OPEN_PAYMENTS, false) == true) {
+            AdminPaymentsNavSignal.openTick.value += 1
+            intent.removeExtra(com.example.payments.PaymentNotifications.EXTRA_OPEN_PAYMENTS)
+        }
         if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
             val shared = intent.getStringExtra(Intent.EXTRA_TEXT)
             if (!shared.isNullOrBlank()) {
@@ -211,6 +220,27 @@ fun ESkyTellApp(viewModel: MainViewModel) {
     var showPermissionsSheet by remember { mutableStateOf(false) }
     var showHistorySheet by remember { mutableStateOf(false) }
     var showAdminStudio by remember { mutableStateOf(false) }
+    var adminInitialTab by remember { mutableStateOf(0) }
+    val paymentState by viewModel.paymentState.collectAsStateWithLifecycle()
+    val openPaymentsTick by AdminPaymentsNavSignal.openTick.collectAsStateWithLifecycle()
+    LaunchedEffect(openPaymentsTick, uiState.isAdmin) {
+        if (openPaymentsTick > 0 && uiState.isAdmin) {
+            adminInitialTab = 3
+            showAdminStudio = true
+        }
+    }
+    val notifPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { }
+    LaunchedEffect(uiState.isAdmin) {
+        if (uiState.isAdmin && android.os.Build.VERSION.SDK_INT >= 33 &&
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                context, android.Manifest.permission.POST_NOTIFICATIONS
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     val btPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -262,7 +292,13 @@ fun ESkyTellApp(viewModel: MainViewModel) {
             onToggleAnnouncementPublished = viewModel::toggleAdminAnnouncementPublished,
             onDeleteAnnouncement = viewModel::deleteAdminAnnouncement,
             onSetUserSubscription = viewModel::setAdminUserSubscription,
-            onClose = { showAdminStudio = false }
+            paymentState = paymentState,
+            initialTab = adminInitialTab,
+            onSavePaymentConfig = viewModel::savePaymentConfig,
+            onApprovePayment = viewModel::approvePaymentRequest,
+            onRejectPayment = viewModel::rejectPaymentRequest,
+            onDeletePayment = viewModel::deletePaymentRequest,
+            onClose = { showAdminStudio = false; adminInitialTab = 0 }
         )
         return
     }
@@ -570,9 +606,11 @@ fun ESkyTellApp(viewModel: MainViewModel) {
     }
 
     if (uiState.showPaywallSheet) {
-        PaywallBottomSheet(
+        PaymentCheckoutSheet(
             appConfig = uiState.appConfig,
-            onOpenPaymentUrl = { url -> viewModel.openExternalAction(url) },
+            paymentState = paymentState,
+            isSubscriptionActive = uiState.isSubscriptionActive,
+            onSubmit = viewModel::submitPaymentReceipt,
             onDismiss = viewModel::dismissPaywallSheet
         )
     }

@@ -253,7 +253,7 @@ fun MoreAndAccountScreen(
             item {
                 val tier = SubscriptionTier.fromRaw(profile?.subscriptionTier ?: SubscriptionTier.FREE.name)
                 val isFreeMode = !config.subscriptionRequired
-                val isPro = profile?.hasActiveSubscription == true || uiState.isAdmin
+                val isPro = uiState.isSubscriptionActive || uiState.isAdmin
 
                 Card(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -285,7 +285,7 @@ fun MoreAndAccountScreen(
                                     Text(
                                         text = when {
                                             isFreeMode -> "حالت فعلی: کاملاً رایگان برای همه کاربران"
-                                            isPro -> "اشتراک فعال: ${tier.labelFa}"
+                                            isPro -> "اشتراک فعال: ${tier.labelFa}" + (profile?.subscriptionExpiresAt?.let { " تا ${formatFaDate(it.toDate())}" } ?: "")
                                             else -> "نیاز به فعال‌سازی اشتراک Pro"
                                         },
                                         style = MaterialTheme.typography.bodySmall,
@@ -295,12 +295,12 @@ fun MoreAndAccountScreen(
                             }
                         }
 
-                        if (!isFreeMode && !isPro) {
+                        if (!isFreeMode && !uiState.isAdmin) {
                             Button(
                                 onClick = onOpenPaywall,
                                 modifier = Modifier.fillMaxWidth().height(48.dp).testTag("more_upgrade_btn")
                             ) {
-                                Text("مشاهده پلن‌ها (${config.monthlyPriceLabel})")
+                                Text(if (isPro) "تمدید اشتراک" else "خرید اشتراک و ارسال فیش")
                             }
                         }
                     }

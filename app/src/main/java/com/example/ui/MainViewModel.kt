@@ -36,6 +36,13 @@ import com.example.data.model.TransferMode
 import com.example.data.model.TransferSessionState
 import com.example.data.model.UserProfile
 import com.example.data.remote.CloudAdminRepository
+import com.example.data.remote.PaymentRepository
+import com.example.data.model.BankCardInfo
+import com.example.data.model.CryptoWalletInfo
+import com.example.data.model.PaymentConfig
+import com.example.data.model.PaymentMethod
+import com.example.data.model.PaymentPlan
+import com.example.data.model.PaymentRequest
 import com.example.data.repository.TransferRepository
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
@@ -53,6 +60,14 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+
+data class PaymentUiState(
+    val config: PaymentConfig = PaymentConfig(),
+    val myRequests: List<PaymentRequest> = emptyList(),
+    val adminRequests: List<PaymentRequest> = emptyList(),
+    val isSubmitting: Boolean = false,
+    val submitSuccessTick: Int = 0
+)
 
 data class MainUiState(
     val currentUserId: String = "",
@@ -114,7 +129,15 @@ data class MainUiState(
         get() = if (activeSimSlot == 2) sim2DisplayLabel else sim1DisplayLabel
 
     val hasProBridgeAccess: Boolean
-        get() = !appConfig.subscriptionRequired || isAdmin || (userProfile?.hasActiveSubscription == true)
+        get() = !appConfig.subscriptionRequired || isAdmin || isSubscriptionActive
+
+    val isSubscriptionActive: Boolean
+        get() {
+            val p = userProfile ?: return false
+            if (!p.hasActiveSubscription) return false
+            val exp = p.subscriptionExpiresAt ?: return true
+            return exp.toDate().time > System.currentTimeMillis()
+        }
 
     val unreadSmsTotal: Int
         get() = smsThreads.sumOf { it.unreadCount }
@@ -131,6 +154,7 @@ class MainViewModel(
     private val repository: TransferRepository,
     val bluetoothManager: BluetoothTransferManager,
     private val cloudAdminRepository: CloudAdminRepository,
+    private val paymentRepository: PaymentRepository,
     private val currentUserId: String,
     private val currentUserEmail: String,
     private val isAdmin: Boolean
@@ -1056,6 +1080,136 @@ class MainViewModel(
         bluetoothManager.clearTransferState()
     }
 
+    // --- Manual payments (card-to-card / crypto) ---
+    private val _paymentSubmitting = MutableStateFlow(false)
+    private val _paymentSubmitTick = MutableStateFlow(0)
+
+    val paymentState: StateFlow<PaymentUiState> = combine(
+        paymentRepository.observeConfig(),
+        paymentRepository.observeMyRequests(currentUserId),
+        if (isAdmin) paymentRepository.observeAllRequestsForAdmin() else flowOf(emptyList()),
+        _paymentSubmitting,
+        _paymentSubmitTick
+    ) { cfg, mine, all, submitting, tick ->
+        PaymentUiState(cfg, mine, all, submitting, tick)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), PaymentUiState())
+
+    init {
+        if (isAdmin) {
+            com.example.payments.PaymentNotifications.schedule(appContext)
+            viewModelScope.launch {
+                paymentRepository.observeAllRequestsForAdmin().collect { list ->
+                    com.example.payments.PaymentNotifications.notifyUnseen(appContext, list)
+                }
+            }
+        }
+    }
+
+    fun submitPaymentReceipt(
+        plan: PaymentPlan,
+        method: PaymentMethod,
+        destination: String,
+        trackingCode: String,
+        imageUri: Uri?
+    ) {
+        viewModelScope.launch {
+            _paymentSubmitting.value = true
+            val base64 = if (imageUri != null) {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { compressReceiptImage(imageUri) }.getOrNull()
+                }
+            } else ""
+            if (imageUri != null && base64.isNullOrEmpty()) {
+                _paymentSubmitting.value = false
+                _snackbarMessage.value = "خواندن تصویر فیش ممکن نشد. تصویر دیگری انتخاب کنید."
+                return@launch
+            }
+            val amount = paymentState.value.config.priceFor(plan)
+            val res = paymentRepository.submitRequest(
+                plan = plan,
+                amountToman = amount,
+                method = method,
+                destination = destination,
+                trackingCode = trackingCode,
+                receiptImageBase64 = base64.orEmpty()
+            )
+            _paymentSubmitting.value = false
+            if (res.isSuccess) {
+                _paymentSubmitTick.value += 1
+                _snackbarMessage.value = "فیش شما ثبت شد. پس از تایید مدیر، اشتراک خودکار فعال می‌شود."
+            } else {
+                _snackbarMessage.value = res.exceptionOrNull()?.message ?: "ثبت فیش ناموفق بود."
+            }
+        }
+    }
+
+    private fun compressReceiptImage(uri: Uri): String {
+        val resolver = appContext.contentResolver
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        resolver.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, bounds) }
+        var sample = 1
+        while (bounds.outWidth / sample > 2000 || bounds.outHeight / sample > 2000) sample *= 2
+        val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+        val raw = resolver.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }
+            ?: throw IllegalStateException("decode failed")
+        var maxSide = 1280
+        var quality = 70
+        while (true) {
+            val scale = minOf(1f, maxSide.toFloat() / maxOf(raw.width, raw.height))
+            val bmp = if (scale < 1f) android.graphics.Bitmap.createScaledBitmap(
+                raw, (raw.width * scale).toInt().coerceAtLeast(1), (raw.height * scale).toInt().coerceAtLeast(1), true
+            ) else raw
+            val out = java.io.ByteArrayOutputStream()
+            bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, out)
+            val b64 = android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+            if (b64.length <= 650_000 || maxSide <= 480) return b64
+            maxSide = (maxSide * 0.75f).toInt()
+            quality = (quality - 10).coerceAtLeast(40)
+        }
+    }
+
+    fun savePaymentConfig(
+        monthlyToman: Long,
+        yearlyToman: Long,
+        instructions: String,
+        cards: List<BankCardInfo>,
+        wallets: List<CryptoWalletInfo>
+    ) {
+        if (!isAdmin) return
+        viewModelScope.launch {
+            _isCloudSaving.value = true
+            val res = paymentRepository.saveConfig(monthlyToman, yearlyToman, instructions, cards, wallets)
+            _isCloudSaving.value = false
+            _snackbarMessage.value = if (res.isSuccess) "اطلاعات پرداخت و قیمت‌ها ذخیره شد."
+            else "خطا در ذخیره اطلاعات پرداخت: ${res.exceptionOrNull()?.localizedMessage ?: ""}"
+        }
+    }
+
+    fun approvePaymentRequest(request: PaymentRequest, note: String) {
+        if (!isAdmin) return
+        viewModelScope.launch {
+            val res = paymentRepository.approveRequest(request, note)
+            _snackbarMessage.value = if (res.isSuccess) "تایید شد؛ اشتراک «${request.userName}» فعال شد."
+            else "خطا در تایید: ${res.exceptionOrNull()?.localizedMessage ?: ""}"
+        }
+    }
+
+    fun rejectPaymentRequest(request: PaymentRequest, note: String) {
+        if (!isAdmin) return
+        viewModelScope.launch {
+            val res = paymentRepository.rejectRequest(request, note)
+            _snackbarMessage.value = if (res.isSuccess) "درخواست رد شد." else "خطا در رد درخواست."
+        }
+    }
+
+    fun deletePaymentRequest(id: String) {
+        if (!isAdmin) return
+        viewModelScope.launch {
+            val res = paymentRepository.deleteRequest(id)
+            _snackbarMessage.value = if (res.isSuccess) "درخواست حذف شد." else "خطا در حذف درخواست."
+        }
+    }
+
     // --- Cloud Account & Admin Studio ---
     fun updateUserSimLabels(sim1Label: String, sim2Label: String) {
         viewModelScope.launch {
@@ -1237,11 +1391,13 @@ class MainViewModel(
                 val repo = TransferRepository(appCtx, db.transferDao())
                 val btMgr = BluetoothTransferManager(appCtx)
                 val cloudRepo = CloudAdminRepository(appCtx)
+                val payRepo = PaymentRepository(appCtx)
                 return MainViewModel(
                     appContext = appCtx,
                     repository = repo,
                     bluetoothManager = btMgr,
                     cloudAdminRepository = cloudRepo,
+                    paymentRepository = payRepo,
                     currentUserId = userId,
                     currentUserEmail = userEmail,
                     isAdmin = isAdmin

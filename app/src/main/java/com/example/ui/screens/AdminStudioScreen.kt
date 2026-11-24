@@ -46,7 +46,12 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
+import androidx.compose.material3.ScrollableTabRow
+import androidx.compose.material.icons.rounded.Payments
+import com.example.data.model.BankCardInfo
+import com.example.data.model.CryptoWalletInfo
+import com.example.data.model.PaymentRequest
+import com.example.ui.PaymentUiState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -93,11 +98,17 @@ fun AdminStudioScreen(
     onToggleAnnouncementPublished: (id: String, published: Boolean) -> Unit,
     onDeleteAnnouncement: (id: String) -> Unit,
     onSetUserSubscription: (targetUserId: String, hasActive: Boolean, tier: SubscriptionTier) -> Unit,
+    paymentState: PaymentUiState,
+    initialTab: Int,
+    onSavePaymentConfig: (Long, Long, String, List<BankCardInfo>, List<CryptoWalletInfo>) -> Unit,
+    onApprovePayment: (PaymentRequest, String) -> Unit,
+    onRejectPayment: (PaymentRequest, String) -> Unit,
+    onDeletePayment: (String) -> Unit,
     onClose: () -> Unit
 ) {
     BackHandler { onClose() }
 
-    var selectedTab by remember { mutableIntStateOf(0) }
+    var selectedTab by remember(initialTab) { mutableIntStateOf(initialTab) }
     var editingModule by remember { mutableStateOf<AnnouncementModule?>(null) }
     var showNewModuleDialog by remember { mutableStateOf(false) }
 
@@ -188,7 +199,7 @@ fun AdminStudioScreen(
                     .fillMaxSize()
                     .widthIn(max = 720.dp)
             ) {
-                TabRow(selectedTabIndex = selectedTab) {
+                ScrollableTabRow(selectedTabIndex = selectedTab, edgePadding = 8.dp) {
                     Tab(
                         selected = selectedTab == 0,
                         onClick = { selectedTab = 0 },
@@ -209,6 +220,14 @@ fun AdminStudioScreen(
                         text = { Text("کاربران (${uiState.adminUsers.size})") },
                         icon = { Icon(Icons.Rounded.People, contentDescription = null) },
                         modifier = Modifier.testTag("admin_tab_users")
+                    )
+                    val pendingCount = paymentState.adminRequests.count { it.status == "PENDING" }
+                    Tab(
+                        selected = selectedTab == 3,
+                        onClick = { selectedTab = 3 },
+                        text = { Text(if (pendingCount > 0) "پرداخت‌ها ($pendingCount)" else "پرداخت‌ها") },
+                        icon = { Icon(Icons.Rounded.Payments, contentDescription = null) },
+                        modifier = Modifier.testTag("admin_tab_payments")
                     )
                 }
 
@@ -258,9 +277,18 @@ fun AdminStudioScreen(
                         onDeleteModule = onDeleteAnnouncement
                     )
 
-                    else -> UsersAdminTab(
+                    2 -> UsersAdminTab(
                         users = uiState.adminUsers,
                         onSetSubscription = onSetUserSubscription
+                    )
+
+                    else -> PaymentsAdminTab(
+                        paymentState = paymentState,
+                        isSaving = uiState.isCloudSaving,
+                        onSaveConfig = onSavePaymentConfig,
+                        onApprove = onApprovePayment,
+                        onReject = onRejectPayment,
+                        onDelete = onDeletePayment
                     )
                 }
             }
@@ -627,6 +655,9 @@ private fun UsersAdminTab(
                         Column(modifier = Modifier.weight(1f)) {
                             Text(user.displayName, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
                             Text(user.email, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            user.subscriptionExpiresAt?.let { exp ->
+                                Text("انقضا: ${formatFaDate(exp.toDate())}", style = MaterialTheme.typography.labelSmall, color = ChampagneGold)
+                            }
                         }
                         Surface(
                             color = if (user.hasActiveSubscription) EmeraldSuccess.copy(alpha = 0.18f)

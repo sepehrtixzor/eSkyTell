@@ -27,6 +27,22 @@ import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Sms
 import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.material.icons.rounded.Email
+import com.google.firebase.Firebase
+import com.google.firebase.auth.auth
+import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
+import com.google.firebase.auth.FirebaseAuthInvalidUserException
+import com.google.firebase.auth.FirebaseAuthUserCollisionException
+import com.google.firebase.auth.FirebaseAuthWeakPasswordException
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -72,6 +88,7 @@ fun AuthScreen(
 
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var infoMessage by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
         attemptAutoSignIn(
@@ -199,6 +216,31 @@ fun AuthScreen(
                 }
             }
 
+            EmailAuthCard(
+                enabled = !isLoading,
+                onBusy = { busy -> isLoading = busy },
+                onError = { msg -> errorMessage = msg },
+                onInfo = { msg -> infoMessage = msg },
+                onAuthSuccess = onAuthSuccess
+            )
+
+            infoMessage?.let { msg ->
+                Surface(
+                    color = MintJade.copy(alpha = 0.14f),
+                    border = BorderStroke(1.dp, MintJade.copy(alpha = 0.5f)),
+                    shape = MaterialTheme.shapes.medium,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(text = msg, style = MaterialTheme.typography.bodySmall, color = MintJade, modifier = Modifier.padding(12.dp))
+                }
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                HorizontalDivider(modifier = Modifier.weight(1f))
+                Text("  یا  ", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                HorizontalDivider(modifier = Modifier.weight(1f))
+            }
+
             errorMessage?.let { msg ->
                 Surface(
                     color = RoseError.copy(alpha = 0.14f),
@@ -296,6 +338,130 @@ private fun FeatureHighlightRow(
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(text = title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
             Text(text = subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+
+@Composable
+private fun EmailAuthCard(
+    enabled: Boolean,
+    onBusy: (Boolean) -> Unit,
+    onError: (String?) -> Unit,
+    onInfo: (String?) -> Unit,
+    onAuthSuccess: () -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var isRegister by remember { mutableStateOf(false) }
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+
+    fun mapError(e: Exception): String = when (e) {
+        is FirebaseAuthWeakPasswordException -> "رمز عبور باید حداقل ۶ کاراکتر باشد."
+        is FirebaseAuthUserCollisionException -> "این ایمیل قبلاً ثبت شده است. وارد شوید."
+        is FirebaseAuthInvalidUserException -> "حسابی با این ایمیل پیدا نشد."
+        is FirebaseAuthInvalidCredentialsException -> "ایمیل یا رمز عبور اشتباه است."
+        else -> "خطا: ${e.localizedMessage ?: "ارتباط برقرار نشد"}"
+    }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.6f)),
+        shape = MaterialTheme.shapes.large,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(
+                text = if (isRegister) "ساخت حساب با ایمیل" else "ورود با ایمیل",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+            OutlinedTextField(
+                value = email,
+                onValueChange = { email = it.trim() },
+                label = { Text("ایمیل") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                modifier = Modifier.fillMaxWidth().testTag("email_field")
+            )
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it },
+                label = { Text("رمز عبور") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                modifier = Modifier.fillMaxWidth().testTag("password_field")
+            )
+            if (isRegister) {
+                OutlinedTextField(
+                    value = confirm,
+                    onValueChange = { confirm = it },
+                    label = { Text("تکرار رمز عبور") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            Button(
+                enabled = enabled,
+                onClick = {
+                    onError(null); onInfo(null)
+                    if (!android.util.Patterns.EMAIL_ADDRESS.matcher(email).matches()) {
+                        onError("ایمیل معتبر وارد کنید."); return@Button
+                    }
+                    if (password.length < 6) {
+                        onError("رمز عبور باید حداقل ۶ کاراکتر باشد."); return@Button
+                    }
+                    if (isRegister && password != confirm) {
+                        onError("تکرار رمز عبور یکسان نیست."); return@Button
+                    }
+                    scope.launch {
+                        onBusy(true)
+                        try {
+                            if (isRegister) {
+                                val res = Firebase.auth.createUserWithEmailAndPassword(email, password).await()
+                                runCatching { res.user?.sendEmailVerification()?.await() }
+                            } else {
+                                Firebase.auth.signInWithEmailAndPassword(email, password).await()
+                            }
+                            onAuthSuccess()
+                        } catch (e: Exception) {
+                            onError(mapError(e))
+                        } finally {
+                            onBusy(false)
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().height(50.dp).testTag("email_auth_button")
+            ) {
+                Icon(Icons.Rounded.Email, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(if (isRegister) "ثبت‌نام" else "ورود", fontWeight = FontWeight.Bold)
+            }
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                TextButton(onClick = { isRegister = !isRegister; onError(null) }) {
+                    Text(if (isRegister) "حساب دارید؟ ورود" else "حساب ندارید؟ ثبت‌نام")
+                }
+                if (!isRegister) {
+                    TextButton(onClick = {
+                        onError(null); onInfo(null)
+                        if (!android.util.Patterns.EMAIL_ADDRESS.matcher(email).matches()) {
+                            onError("برای بازیابی، ابتدا ایمیل را وارد کنید."); return@TextButton
+                        }
+                        scope.launch {
+                            try {
+                                Firebase.auth.sendPasswordResetEmail(email).await()
+                                onInfo("لینک بازیابی رمز به ایمیل شما ارسال شد.")
+                            } catch (e: Exception) {
+                                onError(mapError(e))
+                            }
+                        }
+                    }) { Text("فراموشی رمز") }
+                }
+            }
         }
     }
 }
